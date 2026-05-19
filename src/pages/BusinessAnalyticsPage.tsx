@@ -1,0 +1,781 @@
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  CalendarRange,
+  Clock3,
+  Database,
+  PhilippinePeso,
+  TrendingUp,
+  UsersRound,
+} from "lucide-react";
+import { useLocation, useNavigate } from "react-router-dom";
+import { formatApiErrorForUi } from "../lib/formatApiError";
+import { resolveEffectiveModelId } from "../lib/resolveDashboardModel";
+import * as dashboardService from "../services/dashboardService";
+import type { components } from "../types/api";
+import { SkeletonDashboard } from "../components/dashboard/SkeletonDashboard";
+import { SavesModal } from "../components/modals/SavesModal";
+import {
+  BusinessAnalyticsTab,
+  DataQualityItem,
+  NetAmountPoint,
+  RouteVolume,
+} from "../components/dashboard/tabs/BusinessAnalyticsTab";
+
+type BusinessAnalyticsResponse = components["schemas"]["BusinessAnalyticsResponse"];
+type ModelDropdownItem = components["schemas"]["ModelDropdownItem"];
+
+interface MetricsRouteState {
+  selectedModelId?: number;
+  selectedModelVersion?: string;
+}
+
+interface BusinessAnalyticsPageProps {
+  isBackgroundPreview?: boolean;
+}
+
+interface StatCardProps {
+  id: string;
+  label: string;
+  value: string;
+  helper: string;
+  implication: string;
+  icon: React.ReactNode;
+  isFlipped: boolean;
+  onToggle: (id: string) => void;
+}
+
+const formatCompactRevenue = (value: number) => {
+  const compact = new Intl.NumberFormat("en-US", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(value);
+
+  return `₱${compact.toUpperCase()}`;
+};
+
+/** `YYYY-MM` → `Jan 2022` (UTC month boundary). */
+const formatYearMonthLabel = (ym: string): string => {
+  const match = /^(\d{4})-(\d{2})$/.exec(ym.trim());
+  if (!match) return ym;
+  const y = Number(match[1]);
+  const mo = Number(match[2]) - 1;
+  if (!Number.isFinite(y) || mo < 0 || mo > 11) return ym;
+  return new Date(Date.UTC(y, mo, 1)).toLocaleDateString("en-US", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+};
+
+const calendarYearMonthRangeLabel = (year: number): string => {
+  const start = new Date(Date.UTC(year, 0, 1)).toLocaleDateString("en-US", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  const end = new Date(Date.UTC(year, 11, 1)).toLocaleDateString("en-US", {
+    month: "short",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+  return `${start} - ${end}`;
+};
+
+const StatCard: React.FC<StatCardProps> = ({
+  id,
+  label,
+  value,
+  helper,
+  implication,
+  icon,
+  isFlipped,
+  onToggle,
+}) => (
+  <button
+    type="button"
+    onClick={() => onToggle(id)}
+    className="group perspective h-56 w-full text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-teal-500 xl:h-52"
+    aria-pressed={isFlipped}
+    aria-label={`Flip ${label} KPI card`}
+  >
+    <div
+      className={`relative h-full w-full transform-style-preserve-3d rounded-2xl transition-transform duration-500 ${
+        isFlipped ? "rotate-y-180" : ""
+      }`}
+    >
+      <div className="backface-hidden absolute inset-0 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm">
+        <p className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+          {label}
+        </p>
+        <p className="mt-2 text-3xl font-semibold text-slate-900">{value}</p>
+        <p className="mt-4 text-xs font-medium text-teal-700">
+          Click card to view implication.
+        </p>
+        <span className="absolute bottom-4 right-4 inline-flex h-7 w-7 items-center justify-center rounded-full bg-teal-100 text-teal-600">
+          {icon}
+        </span>
+      </div>
+
+      <div className="backface-hidden rotate-y-180 absolute inset-0 flex min-h-0 flex-col rounded-2xl border border-teal-200 bg-teal-50 p-5 shadow-sm">
+        <p className="text-xs font-semibold uppercase tracking-wide text-teal-700">
+          {label}
+        </p>
+        <div className="mt-2 min-h-0 flex-1 space-y-2 overflow-y-auto pr-1">
+          <p className="text-sm text-teal-900">{helper}</p>
+          <p className="text-sm leading-relaxed text-teal-900">{implication}</p>
+        </div>
+        <p className="mt-3 text-xs font-medium text-teal-700">
+          Click card to return.
+        </p>
+      </div>
+    </div>
+  </button>
+);
+
+export const BusinessAnalyticsPage: React.FC<BusinessAnalyticsPageProps> = ({
+  isBackgroundPreview = false,
+}) => {
+  const navigate = useNavigate();
+  const location = useLocation();
+  const routeState = (location.state as MetricsRouteState | null) ?? null;
+  const storedModelId = (() => {
+    try {
+      const rawValue = localStorage.getItem("xocompass:selectedModelId");
+      if (!rawValue) return null;
+      const parsed = Number(rawValue);
+      return Number.isFinite(parsed) ? parsed : null;
+    } catch {
+      return null;
+    }
+  })();
+  const storedModelVersion = (() => {
+    try {
+      return localStorage.getItem("xocompass:selectedModelVersion");
+    } catch {
+      return null;
+    }
+  })();
+
+  const preferredModelId =
+    routeState?.selectedModelId ?? storedModelId ?? null;
+  const preferredModelVersion =
+    routeState?.selectedModelVersion ?? storedModelVersion ?? "";
+
+  const [businessAnalytics, setBusinessAnalytics] =
+    useState<BusinessAnalyticsResponse | null>(null);
+  const [overallBusinessAnalytics, setOverallBusinessAnalytics] =
+    useState<BusinessAnalyticsResponse | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const [models, setModels] = useState<ModelDropdownItem[]>([]);
+  const [isLoadingModels, setIsLoadingModels] = useState(true);
+  const [selectedYearView, setSelectedYearView] = useState<string>("overall");
+  const [netRevenueGranularity, setNetRevenueGranularity] = useState<"month" | "year">("month");
+  const [bookingsGranularity, setBookingsGranularity] = useState<"month" | "year">("month");
+  const [flippedKpis, setFlippedKpis] = useState<Record<string, boolean>>({});
+  const [availableYears, setAvailableYears] = useState<number[]>([]);
+
+  useEffect(() => {
+    if (selectedYearView !== "overall") {
+      setNetRevenueGranularity("month");
+      setBookingsGranularity("month");
+    }
+  }, [selectedYearView]);
+
+  useEffect(() => {
+    const fetchModels = async () => {
+      try {
+        setIsLoadingModels(true);
+        const data = await dashboardService.getModels();
+        setModels(data.available_models ?? []);
+      } catch (error) {
+        console.error("Unable to load models:", error);
+        setModels([]);
+      } finally {
+        setIsLoadingModels(false);
+      }
+    };
+
+    fetchModels();
+  }, []);
+
+  const hasNoData = !isLoadingModels && models.length === 0;
+  const shouldShowColdStart = hasNoData && !isBackgroundPreview;
+  const effectiveModelId = useMemo(
+    () => resolveEffectiveModelId(models, preferredModelId),
+    [models, preferredModelId]
+  );
+  const effectiveModelVersion = useMemo(() => {
+    if (effectiveModelId == null) return preferredModelVersion;
+    const selectedModel = models.find((model) => model.id === effectiveModelId);
+    return selectedModel?.version ?? preferredModelVersion;
+  }, [effectiveModelId, models, preferredModelVersion]);
+
+  useEffect(() => {
+    if (shouldShowColdStart) {
+      setBusinessAnalytics(null);
+      setIsLoading(false);
+      setLoadError("");
+      return;
+    }
+
+    const fetchBusinessAnalytics = async () => {
+      if (effectiveModelId == null) return;
+      try {
+        setIsLoading(true);
+        setLoadError("");
+
+        const data = await dashboardService.getBusinessAnalytics(
+          effectiveModelId,
+          selectedYearView
+        );
+        setBusinessAnalytics(data);
+        if (data.available_years?.length) {
+          const parsed = data.available_years
+            .map((year) => Number(year))
+            .filter((year) => Number.isFinite(year));
+          if (parsed.length) {
+            setAvailableYears((previous) =>
+              Array.from(new Set([...previous, ...parsed])).sort((a, b) => a - b)
+            );
+          }
+        }
+      } catch (error) {
+        console.error("Unable to load business analytics:", error);
+        setLoadError(formatApiErrorForUi(error));
+      } finally {
+        setIsLoading(false);
+      }
+    };
+
+    fetchBusinessAnalytics();
+  }, [effectiveModelId, selectedYearView, shouldShowColdStart]);
+
+  useEffect(() => {
+    if (shouldShowColdStart) {
+      setOverallBusinessAnalytics(null);
+      return;
+    }
+
+    const fetchOverallBusinessAnalytics = async () => {
+      if (effectiveModelId == null) return;
+      try {
+        const data = await dashboardService.getBusinessAnalytics(
+          effectiveModelId,
+          "overall"
+        );
+        setOverallBusinessAnalytics(data);
+      } catch (error) {
+        console.error("Unable to load overall business analytics:", error);
+        setOverallBusinessAnalytics(null);
+      }
+    };
+
+    fetchOverallBusinessAnalytics();
+  }, [effectiveModelId, shouldShowColdStart]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("xocompass:selectedModelId", String(effectiveModelId));
+      localStorage.setItem("xocompass:selectedModelVersion", effectiveModelVersion);
+    } catch {
+      // Ignore localStorage errors in restricted environments.
+    }
+  }, [effectiveModelId, effectiveModelVersion]);
+
+  const growthRate = businessAnalytics?.growth_rate ?? 0;
+  const growthLabel = `${growthRate >= 0 ? "+" : ""}${growthRate.toFixed(1)}%`;
+  const bookingsByYearData = businessAnalytics?.bookings_by_year ?? [];
+  const yearOptions = useMemo(
+    () => {
+      if (availableYears.length) return availableYears;
+      return bookingsByYearData
+        .map((point) => Number(point.year))
+        .filter((year) => Number.isFinite(year))
+        .sort((a, b) => a - b);
+    },
+    [availableYears, bookingsByYearData]
+  );
+  const firstYear = businessAnalytics?.date_coverage?.start_date
+    ? new Date(businessAnalytics.date_coverage.start_date).getFullYear()
+    : Number(bookingsByYearData[0]?.year ?? 0);
+  const lastYear = businessAnalytics?.date_coverage?.end_date
+    ? new Date(businessAnalytics.date_coverage.end_date).getFullYear()
+    : Number(bookingsByYearData[bookingsByYearData.length - 1]?.year ?? 0);
+  const isOverallView = selectedYearView === "overall";
+  const selectedYear = isOverallView ? null : Number(selectedYearView);
+  const canonicalAnalytics = isOverallView
+    ? businessAnalytics
+    : overallBusinessAnalytics ?? businessAnalytics;
+  const selectedYearBookingsByMonth = useMemo(() => {
+    if (selectedYear == null || !Number.isFinite(selectedYear)) return [];
+    return (canonicalAnalytics?.bookings_by_month ?? []).filter((point) =>
+      point.month.startsWith(`${selectedYear}-`)
+    );
+  }, [canonicalAnalytics?.bookings_by_month, selectedYear]);
+  const selectedYearRevenueByMonth = useMemo(() => {
+    if (selectedYear == null || !Number.isFinite(selectedYear)) return [];
+    return (canonicalAnalytics?.revenue_by_month ?? []).filter((point) =>
+      point.month.startsWith(`${selectedYear}-`)
+    );
+  }, [canonicalAnalytics?.revenue_by_month, selectedYear]);
+
+  const hasBackendBookingsByYear = useMemo(
+    () =>
+      Boolean(
+        businessAnalytics?.bookings_by_year &&
+          Array.isArray(businessAnalytics.bookings_by_year) &&
+          businessAnalytics.bookings_by_year.length > 0
+      ),
+    [businessAnalytics?.bookings_by_year]
+  );
+
+  /** Overall KPI view — monthly series from API (parallel to revenue_by_month). */
+  const bookingsMonthlyOverall = useMemo(() => {
+    if (!businessAnalytics) return [];
+    return [...(businessAnalytics.bookings_by_month ?? [])]
+      .sort((a, b) => a.month.localeCompare(b.month))
+      .map((p) => ({ year: p.month, bookings: p.bookings }));
+  }, [businessAnalytics]);
+
+  /** Overall “By year”: bookings_by_year when present; else sum bookings_by_month by calendar year. */
+  const bookingsYearlyOverall = useMemo(() => {
+    if (!businessAnalytics) return [];
+    const apiRows = businessAnalytics.bookings_by_year;
+    if (Array.isArray(apiRows) && apiRows.length > 0) {
+      return [...apiRows]
+        .sort((a, b) => String(a.year).localeCompare(String(b.year)))
+        .map((row) => ({ year: row.year, bookings: row.bookings }));
+    }
+    const totals = new Map<string, number>();
+    for (const point of businessAnalytics.bookings_by_month ?? []) {
+      const yearKey = point.month.slice(0, 4);
+      totals.set(yearKey, (totals.get(yearKey) ?? 0) + point.bookings);
+    }
+    return [...totals.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([year, bookings]) => ({ year, bookings }));
+  }, [businessAnalytics]);
+
+  const bookingsOverTimeDisplayData = useMemo(() => {
+    if (!isOverallView && selectedYear != null && Number.isFinite(selectedYear)) {
+      return [...selectedYearBookingsByMonth]
+        .sort((a, b) => a.month.localeCompare(b.month))
+        .map((p) => ({ year: p.month, bookings: p.bookings }));
+    }
+    if (isOverallView) {
+      return bookingsGranularity === "year"
+        ? bookingsYearlyOverall
+        : bookingsMonthlyOverall;
+    }
+    return [];
+  }, [
+    isOverallView,
+    selectedYear,
+    bookingsGranularity,
+    selectedYearBookingsByMonth,
+    bookingsMonthlyOverall,
+    bookingsYearlyOverall,
+  ]);
+
+  const avgLeadDays = businessAnalytics?.avg_lead_time_days;
+  const averageLeadTimeDisplay =
+    avgLeadDays != null && Number.isFinite(avgLeadDays) ? `${avgLeadDays.toFixed(1)} days` : "—";
+  const averageLeadTimeHelper =
+    avgLeadDays != null && Number.isFinite(avgLeadDays)
+      ? "Mean booking lead time before travel date (from linked dataset)."
+      : "Lead time summary not available for this model snapshot (retrain or relink dataset if needed).";
+  const totalRecordsDisplay = (
+    isOverallView
+      ? businessAnalytics?.total_transaction_count ?? 0
+      : selectedYearBookingsByMonth.reduce((sum, point) => sum + point.bookings, 0)
+  ).toLocaleString("en-US");
+  const totalRevenueDisplay = formatCompactRevenue(
+    isOverallView
+      ? businessAnalytics?.total_revenue != null && Number.isFinite(businessAnalytics.total_revenue)
+        ? businessAnalytics.total_revenue
+        : 0
+      : selectedYearRevenueByMonth.reduce((sum, point) => sum + point.revenue, 0)
+  );
+  const dateCoverageDisplay = useMemo(() => {
+    if (
+      !isOverallView &&
+      selectedYear != null &&
+      Number.isFinite(selectedYear)
+    ) {
+      const prefix = `${selectedYear}-`;
+      const monthKeys = Array.from(
+        new Set([
+          ...selectedYearBookingsByMonth.map((p) => p.month),
+          ...selectedYearRevenueByMonth.map((p) => p.month),
+        ])
+      )
+        .filter((m) => m.startsWith(prefix))
+        .sort();
+      if (monthKeys.length > 0) {
+        const first = monthKeys[0];
+        const last = monthKeys[monthKeys.length - 1];
+        return `${formatYearMonthLabel(first)} - ${formatYearMonthLabel(last)}`;
+      }
+      return calendarYearMonthRangeLabel(selectedYear);
+    }
+    if (firstYear > 0 && lastYear > 0) {
+      return `${firstYear} - ${lastYear}`;
+    }
+    return "—";
+  }, [
+    isOverallView,
+    selectedYear,
+    selectedYearBookingsByMonth,
+    selectedYearRevenueByMonth,
+    firstYear,
+    lastYear,
+  ]);
+  const avgWeeklyBookingsDisplay = (
+    isOverallView
+      ? businessAnalytics?.avg_weekly_bookings ?? 0
+      : selectedYearBookingsByMonth.reduce((sum, point) => sum + point.bookings, 0) / 52
+  ).toFixed(2);
+  const weeklyObservationsDisplay = (
+    isOverallView
+      ? businessAnalytics?.total_weekly_records ?? 0
+      : selectedYearBookingsByMonth.length * 4
+  ).toLocaleString("en-US");
+  const topAirlinesDisplay = businessAnalytics?.top_airlines ?? [];
+  const leadTimeDistributionDisplay = businessAnalytics?.lead_time_distribution ?? [];
+  const topRoutesDisplay = useMemo<RouteVolume[]>(
+    () =>
+      (businessAnalytics?.top_routes ?? []).map((route) => ({
+        route: route.route,
+        bookings: route.count,
+      })),
+    [businessAnalytics?.top_routes]
+  );
+  const netAmountsMonthlyOverall = useMemo<NetAmountPoint[]>(() => {
+    if (!businessAnalytics) return [];
+    return (businessAnalytics.revenue_by_month ?? []).map((point) => ({
+      period: point.month,
+      amount: Number((point.revenue / 1000).toFixed(2)),
+    }));
+  }, [businessAnalytics]);
+
+  const hasBackendRevenueByYear = useMemo(
+    () =>
+      Boolean(
+        businessAnalytics?.revenue_by_year &&
+          Array.isArray(businessAnalytics.revenue_by_year) &&
+          businessAnalytics.revenue_by_year.length > 0
+      ),
+    [businessAnalytics?.revenue_by_year]
+  );
+
+  /** Overall “By year”: always uses `revenue_by_year` when the API sends it; otherwise sums `revenue_by_month`. */
+  const netAmountsYearlyOverall = useMemo<NetAmountPoint[]>(() => {
+    if (!businessAnalytics) return [];
+
+    const apiYearRows = businessAnalytics.revenue_by_year;
+    if (Array.isArray(apiYearRows) && apiYearRows.length > 0) {
+      return [...apiYearRows]
+        .sort((a, b) => Number(a.year) - Number(b.year))
+        .map((row) => ({
+          period: String(row.year),
+          amount: Number((row.revenue / 1000).toFixed(2)),
+        }));
+    }
+
+    const totals = new Map<string, number>();
+    for (const point of businessAnalytics.revenue_by_month ?? []) {
+      const yearKey = point.month.slice(0, 4);
+      totals.set(yearKey, (totals.get(yearKey) ?? 0) + point.revenue);
+    }
+    return [...totals.entries()]
+      .sort(([a], [b]) => Number(a) - Number(b))
+      .map(([period, revenue]) => ({
+        period,
+        amount: Number((revenue / 1000).toFixed(2)),
+      }));
+  }, [businessAnalytics]);
+
+  const netAmountsDisplay = useMemo<NetAmountPoint[]>(() => {
+    if (!businessAnalytics) return [];
+    if (!isOverallView && selectedYear != null && Number.isFinite(selectedYear)) {
+      return netAmountsMonthlyOverall.filter((point) =>
+        point.period.startsWith(`${selectedYear}-`)
+      );
+    }
+    if (isOverallView && netRevenueGranularity === "year") {
+      return netAmountsYearlyOverall;
+    }
+    return netAmountsMonthlyOverall;
+  }, [
+    businessAnalytics,
+    isOverallView,
+    selectedYear,
+    netRevenueGranularity,
+    netAmountsMonthlyOverall,
+    netAmountsYearlyOverall,
+  ]);
+  const dataQualityDisplay = useMemo<DataQualityItem[]>(() => {
+    if (!businessAnalytics?.data_quality) return [];
+    return [
+      {
+        label: "Total Rows",
+        count: businessAnalytics.data_quality.total_rows,
+        descriptiveOnly: true,
+      },
+      { label: "Missing Route", count: businessAnalytics.data_quality.missing_route },
+      { label: "Missing Airline", count: businessAnalytics.data_quality.missing_airline },
+      {
+        label: "Missing Travel Date",
+        count: businessAnalytics.data_quality.missing_travel_date,
+      },
+      {
+        label: "Invalid Travel Date",
+        count: businessAnalytics.data_quality.invalid_travel_date,
+      },
+      { label: "Missing Revenue", count: businessAnalytics.data_quality.missing_revenue },
+    ];
+  }, [businessAnalytics?.data_quality]);
+  const toggleKpiCard = (cardId: string) => {
+    setFlippedKpis((prev) => ({ ...prev, [cardId]: !prev[cardId] }));
+  };
+
+  return (
+    <div className="relative min-h-full">
+      <div
+        className={`min-h-full bg-[#F9FAFB] px-6 py-6 -m-8 ${
+          shouldShowColdStart ? "pointer-events-none select-none grayscale saturate-0" : ""
+        }`}
+      >
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <h1 className="text-[30px] font-semibold leading-tight tracking-tight text-slate-900">
+            Business Analytics Dashboard
+          </h1>
+          <p className="mt-1 text-[14px] text-slate-600">
+            High-level performance overview for KJS POS and travel demand analytics.{" "}
+            <span className="font-medium text-slate-700">
+              {effectiveModelId != null
+                ? `Model ${effectiveModelVersion} (ID ${effectiveModelId})`
+                : "Selecting latest trained model…"}
+            </span>
+          </p>
+        </div>
+      </div>
+
+      {isLoading && (
+        <p className="mt-6 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-[14px] text-slate-600 shadow-sm">
+          Loading dashboard stats from backend...
+        </p>
+      )}
+
+      {loadError && (
+        <p className="mt-6 rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-[14px] text-red-700 shadow-sm">
+          {loadError} Showing fallback data where needed.
+        </p>
+      )}
+
+      {isLoadingModels && !isBackgroundPreview ? (
+        <p className="mt-6 rounded-2xl border border-slate-200 bg-white px-4 py-3 text-[14px] text-slate-600 shadow-sm">
+          <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-teal-600 border-t-transparent align-middle" />{" "}
+          Loading model registry…
+        </p>
+      ) : null}
+
+      <div className="mt-6 space-y-8">
+      {shouldShowColdStart ? (
+        <SkeletonDashboard />
+      ) : (
+      <>
+
+      <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6">
+        <StatCard
+          id="total-records"
+          label="Total Records"
+          value={totalRecordsDisplay}
+          implication={
+            isOverallView
+              ? "More records usually improve trend stability and reduce one-off noise."
+              : "Year record count shows how representative this period is."
+          }
+          icon={<Database className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["total-records"])}
+          onToggle={toggleKpiCard}
+          helper={
+            isOverallView
+              ? "Records available in model-ready booking dataset."
+              : "Records for the selected year from backend year-sliced analytics."
+          }
+        />
+        <StatCard
+          id="total-revenue"
+          label="Total Revenue"
+          value={totalRevenueDisplay}
+          implication={
+            isOverallView
+              ? "Revenue trend helps gauge demand monetization over time."
+              : "Year revenue shows whether this period is high or low earning."
+          }
+          icon={<PhilippinePeso className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["total-revenue"])}
+          onToggle={toggleKpiCard}
+          helper={
+            isOverallView
+              ? `Growth signal: ${growthLabel} YoY`
+              : `Growth signal for selected year context: ${growthLabel}`
+          }
+        />
+        <StatCard
+          id="date-coverage"
+          label="Date Coverage"
+          value={dateCoverageDisplay}
+          implication={
+            isOverallView
+              ? "Wider coverage captures seasonality and improves comparability."
+              : "Single-year scope focuses one cycle and omits long-term effects."
+          }
+          icon={<CalendarRange className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["date-coverage"])}
+          onToggle={toggleKpiCard}
+          helper={
+            isOverallView
+              ? "Coverage window of historical booking records."
+              : "Selected year-only scope."
+          }
+        />
+        <StatCard
+          id="average-lead-time"
+          label="Average Lead Time"
+          value={averageLeadTimeDisplay}
+          implication={
+            isOverallView
+              ? "Lead-time shifts can indicate changing planning behavior."
+              : "Year lead-time changes highlight booking urgency for this period."
+          }
+          icon={<Clock3 className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["average-lead-time"])}
+          onToggle={toggleKpiCard}
+          helper={averageLeadTimeHelper}
+        />
+        <StatCard
+          id="weekly-observations"
+          label="Weekly Observations"
+          value={weeklyObservationsDisplay}
+          implication={
+            isOverallView
+              ? "Consistent weekly coverage strengthens diagnostics."
+              : "Year weekly count indicates completeness for analysis."
+          }
+          icon={<TrendingUp className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["weekly-observations"])}
+          onToggle={toggleKpiCard}
+          helper={
+            isOverallView
+              ? "Number of weekly records in this dataset."
+              : "Weekly records in the selected year from backend aggregation."
+          }
+        />
+        <StatCard
+          id="average-weekly-bookings"
+          label="Average Weekly Bookings"
+          value={avgWeeklyBookingsDisplay}
+          implication={
+            isOverallView
+              ? "Baseline weekly demand helps benchmark trend strength."
+              : "Year weekly average shows demand level vs baseline."
+          }
+          icon={<UsersRound className="h-4 w-4" />}
+          isFlipped={Boolean(flippedKpis["average-weekly-bookings"])}
+          onToggle={toggleKpiCard}
+          helper={
+            isOverallView
+              ? "Mean bookings per week over the model-ready dataset window."
+              : "Mean bookings per week for the selected year."
+          }
+        />
+      </section>
+
+      <BusinessAnalyticsTab
+        bookingsByYear={bookingsOverTimeDisplayData}
+        netAmounts={netAmountsDisplay}
+        topAirlines={topAirlinesDisplay}
+        leadTimeDistribution={leadTimeDistributionDisplay}
+        topRoutes={topRoutesDisplay}
+        dataQualityItems={dataQualityDisplay}
+        bookingsPeriodLabel={
+          isOverallView ? (bookingsGranularity === "year" ? "Year" : "Month") : "Month"
+        }
+        bookingsOverTimeDescription={
+          isOverallView
+            ? bookingsGranularity === "year"
+              ? hasBackendBookingsByYear
+                ? "Total bookings by calendar year — values from API field bookings_by_year."
+                : "Total bookings by calendar year — summed from bookings_by_month (bookings_by_year not returned)."
+              : "Total bookings by month from bookings_by_month (overall dataset)."
+            : `Monthly bookings for ${selectedYear} — same monthly keys as Net Revenue for this year.`
+        }
+        netRevenuePeriodLabel={
+          isOverallView ? (netRevenueGranularity === "year" ? "Year" : "Month") : "Month"
+        }
+        netRevenueChartDescription={
+          isOverallView
+            ? netRevenueGranularity === "year"
+              ? hasBackendRevenueByYear
+                ? "Net revenue in thousands by calendar year — values from API field revenue_by_year."
+                : "Net revenue in thousands by calendar year — summed from revenue_by_month (revenue_by_year not returned)."
+              : "Net revenue in thousands by month from revenue_by_month (overall dataset)."
+            : "Net revenue in thousands by month for the selected year."
+        }
+        showNetRevenueGranularityToggle={isOverallView}
+        netRevenueGranularity={netRevenueGranularity}
+        onNetRevenueGranularityChange={setNetRevenueGranularity}
+        showBookingsGranularityToggle={isOverallView}
+        bookingsGranularity={bookingsGranularity}
+        onBookingsGranularityChange={setBookingsGranularity}
+      />
+      </>
+      )}
+      </div>
+    </div>
+      {shouldShowColdStart && (
+        <>
+          <div className="pointer-events-none fixed inset-0 z-30 bg-white/35 backdrop-blur-2xl" />
+          <div className="relative z-50">
+            <SavesModal
+              open={true}
+              lockOpen={true}
+              title="Upload your first KJS booking dataset"
+              description="XoCompass is ready. Upload a dataset to generate your first model, then we will unlock live KPI cards, forecasts, and dashboard insights."
+              actionLabel="Go to Saves and Upload"
+              onAction={() => navigate("/saves")}
+            />
+          </div>
+        </>
+      )}
+      {!shouldShowColdStart && (
+        <div className="fixed bottom-6 right-10 z-40">
+          <div className="flex items-center gap-3 rounded-2xl border border-teal-200 bg-white px-4 py-2.5 shadow-[0_10px_28px_rgba(2,132,199,0.22)] ring-1 ring-teal-100/70">
+            <span className="text-xs font-semibold uppercase tracking-wide text-slate-600">
+              KPI Year View
+            </span>
+            <select
+              aria-label="KPI Year View"
+              className="rounded-lg border border-teal-200 bg-teal-50 px-2.5 py-1.5 text-sm font-semibold text-slate-800 shadow-sm focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-200"
+              value={selectedYearView}
+              onChange={(event) => setSelectedYearView(event.target.value)}
+            >
+              <option value="overall">Overall</option>
+              {yearOptions.map((year) => (
+                <option key={year} value={String(year)}>
+                  {year}
+                </option>
+              ))}
+            </select>
+            <span className="text-xs font-semibold text-slate-600">
+            </span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};

@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -11,6 +11,13 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
+import {
+  formatAirlineLabel,
+  getAirlineBrandColor,
+  getAirlineFaviconUrl,
+  getAirlineIataLogoUrl,
+  getAirlineLogoUrl,
+} from "../../../lib/airlineBranding";
 
 export interface BookingsByYearPoint {
   year: number | string;
@@ -68,81 +75,46 @@ export interface BusinessAnalyticsTabProps {
   onBookingsGranularityChange?: (value: "month" | "year") => void;
 }
 
-const AIRLINE_LOGO_DOMAIN_BY_CODE: Record<string, string> = {
-  "5J": "cebupacificair.com",
-  DG: "cebupacificair.com",
-  PR: "philippineairlines.com",
-  Z2: "zipair.net",
-  SQ: "singaporeair.com",
-  CX: "cathaypacific.com",
-  BR: "evaair.com",
-  NH: "ana.co.jp",
-  JL: "jal.co.jp",
-  KE: "koreanair.com",
-  OZ: "flyasiana.com",
-  TR: "flyscoot.com",
-  AK: "airasia.com",
-};
-
-const AIRLINE_DISPLAY_NAMES: Record<string, string> = {
-  "5J": "Cebu Pacific",
-  DG: "Cebgo",
-  PR: "Philippine Airlines",
-  Z2: "ZIPAIR Tokyo",
-  SQ: "Singapore Airlines",
-  CX: "Cathay Pacific",
-  BR: "EVA Air",
-  NH: "All Nippon Airways",
-  JL: "Japan Airlines",
-  KE: "Korean Air",
-  OZ: "Asiana Airlines",
-  TR: "Scoot",
-  AK: "AirAsia",
-};
-
-const formatAirlineLabel = (code: string) => {
-  const normalized = code.toUpperCase();
-  const name = AIRLINE_DISPLAY_NAMES[normalized];
-  return name ? `${normalized} (${name})` : normalized;
-};
-
-const getAirlineLogoUrl = (airlineCode: string) => {
-  const domain = AIRLINE_LOGO_DOMAIN_BY_CODE[airlineCode.toUpperCase()];
-  return domain ? `https://logo.clearbit.com/${domain}` : null;
-};
-
-const getAirlineFaviconUrl = (airlineCode: string) => {
-  const domain = AIRLINE_LOGO_DOMAIN_BY_CODE[airlineCode.toUpperCase()];
-  return domain ? `https://www.google.com/s2/favicons?sz=64&domain=${domain}` : null;
-};
-
 const AirlineLogo: React.FC<{ code: string; className?: string }> = ({ code, className }) => {
-  const primaryLogo = getAirlineLogoUrl(code);
-  const fallbackLogo = getAirlineFaviconUrl(code);
-  const [useFallback, setUseFallback] = React.useState(false);
-  const [failed, setFailed] = React.useState(false);
+  const logoSources = useMemo(
+    () =>
+      [getAirlineLogoUrl(code), getAirlineFaviconUrl(code), getAirlineIataLogoUrl(code)].filter(
+        (url): url is string => Boolean(url)
+      ),
+    [code]
+  );
+  const [sourceIndex, setSourceIndex] = useState(0);
+  const [failed, setFailed] = useState(false);
 
-  if (failed || (!primaryLogo && !fallbackLogo)) {
+  useEffect(() => {
+    setSourceIndex(0);
+    setFailed(false);
+  }, [code, logoSources.join("|")]);
+
+  if (failed || logoSources.length === 0) {
     return (
       <span
         className={`inline-flex items-center justify-center rounded-sm bg-slate-100 text-[9px] font-semibold text-slate-600 ${
           className ?? "h-5 w-5"
         }`}
       >
-        {code.slice(0, 2)}
+        {code.slice(0, 2).toUpperCase()}
       </span>
     );
   }
 
+  const activeSrc = logoSources[Math.min(sourceIndex, logoSources.length - 1)];
+
   return (
     <img
-      src={useFallback && fallbackLogo ? fallbackLogo : primaryLogo ?? fallbackLogo ?? ""}
+      key={`${code}-${activeSrc}`}
+      src={activeSrc}
       alt={`${code} logo`}
       className={className ?? "h-5 w-5 rounded-sm border border-slate-200 bg-white object-contain p-0.5"}
       loading="lazy"
       onError={() => {
-        if (!useFallback && fallbackLogo) {
-          setUseFallback(true);
+        if (sourceIndex < logoSources.length - 1) {
+          setSourceIndex((prev) => prev + 1);
           return;
         }
         setFailed(true);
@@ -221,16 +193,25 @@ const BookingsOverTimeChart: React.FC<{
 
 const TopAirlinesTooltip: React.FC<{
   active?: boolean;
-  payload?: Array<{ value?: number; payload?: { airline?: string; count?: number } }>;
+  payload?: Array<{
+    value?: number;
+    payload?: { airline?: string; count?: number; fill?: string };
+  }>;
   label?: string | number;
 }> = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   const point = payload[0]?.payload;
   const code = point?.airline ?? String(label ?? "");
   const count = Number(point?.count ?? payload[0]?.value ?? 0);
+  const sliceColor = point?.fill ?? getAirlineBrandColor(code);
   return (
     <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-sm">
       <div className="flex items-center gap-2">
+        <span
+          className="h-2.5 w-2.5 shrink-0 rounded-full"
+          style={{ backgroundColor: sliceColor }}
+          aria-hidden
+        />
         <AirlineLogo
           code={code}
           className="h-4 w-4 rounded-sm border border-slate-200 bg-white object-contain p-0.5"
@@ -251,6 +232,7 @@ const TopAirlinesChart: React.FC<{ airlines: AirlineCount[] }> = ({ airlines }) 
       sortedRows.map((row) => ({
         airline: row.airline_code,
         count: row.count,
+        fill: getAirlineBrandColor(row.airline_code),
       })),
     [sortedRows]
   );
@@ -258,7 +240,6 @@ const TopAirlinesChart: React.FC<{ airlines: AirlineCount[] }> = ({ airlines }) 
     () => sortedRows.reduce((sum, row) => sum + row.count, 0),
     [sortedRows]
   );
-  const piePalette = ["#0D9488", "#14B8A6", "#22D3EE", "#60A5FA", "#818CF8", "#A78BFA"];
 
   return (
     <div className="mt-4 grid h-full min-h-0 grid-rows-[auto_1fr] gap-3 rounded-xl border border-slate-200 bg-slate-50 p-3 xl:grid-cols-[44%_1fr] xl:grid-rows-1">
@@ -275,8 +256,8 @@ const TopAirlinesChart: React.FC<{ airlines: AirlineCount[] }> = ({ airlines }) 
               stroke="#fff"
               strokeWidth={2}
             >
-              {pieRows.map((_, index) => (
-                <Cell key={`top-airline-${index}`} fill={piePalette[index % piePalette.length]} />
+              {pieRows.map((row) => (
+                <Cell key={`top-airline-${row.airline}`} fill={row.fill} />
               ))}
             </Pie>
             <Tooltip content={<TopAirlinesTooltip />} />
@@ -292,10 +273,19 @@ const TopAirlinesChart: React.FC<{ airlines: AirlineCount[] }> = ({ airlines }) 
 
       <div className="flex h-full min-h-0 items-center pr-1">
         <div className="max-h-full w-full space-y-2 overflow-y-auto">
-          {sortedRows.map((row, index) => {
+          {sortedRows.map((row) => {
             const pct = totalBookings > 0 ? (row.count / totalBookings) * 100 : 0;
+            const brandColor = getAirlineBrandColor(row.airline_code);
             return (
-              <div key={row.airline_code} className="grid grid-cols-[auto_1fr_auto] items-center gap-2 text-sm">
+              <div
+                key={row.airline_code}
+                className="grid grid-cols-[auto_auto_1fr_auto] items-center gap-2 text-sm"
+              >
+                <span
+                  className="h-2.5 w-2.5 shrink-0 rounded-full"
+                  style={{ backgroundColor: brandColor }}
+                  aria-hidden
+                />
                 <AirlineLogo
                   code={row.airline_code}
                   className="h-5 w-5 rounded-sm border border-slate-200 bg-white object-contain p-0.5"

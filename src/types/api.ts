@@ -123,7 +123,18 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Request a password reset link (generic success; no account enumeration). */
+        /**
+         * Request a password reset link via email.
+         * @description Self-service password reset request.
+         *
+         *     SECURITY: Always returns 200 with the same generic message regardless
+         *     of whether the email matches a real account. This prevents account
+         *     enumeration via the reset endpoint.
+         *
+         *     The actual email dispatch is the responsibility of the email service
+         *     (TODO — not implemented in this phase). For development, the reset
+         *     URL is logged to the application logger so devs can copy/paste it.
+         */
         post: operations["forgot_password_auth_forgot_password_post"];
         delete?: never;
         options?: never;
@@ -140,7 +151,16 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Consume reset token and set a new password (no auto-login). */
+        /**
+         * Consume a password reset token and set a new password.
+         * @description Consume a reset token. On success, the user's password is updated AND
+         *     all of their refresh tokens are revoked — they must log in fresh with
+         *     the new password.
+         *
+         *     Note: we do NOT auto-login here. Industry standard is to require a
+         *     fresh login after reset, which produces a clean LOGIN audit row and
+         *     confirms the user can actually authenticate with their new password.
+         */
         post: operations["reset_password_auth_reset_password_post"];
         delete?: never;
         options?: never;
@@ -176,7 +196,18 @@ export interface paths {
         get: operations["get_user_admin_users__user_id__get"];
         put?: never;
         post?: never;
-        /** Soft-delete user (deactivate, anonymize email, revoke sessions). */
+        /**
+         * Soft-delete a user (deactivate + anonymize email + revoke sessions).
+         * @description Soft-deletes a user. The User row is preserved (audit FK integrity);
+         *     the email is anonymized; all refresh tokens are revoked.
+         *
+         *     Returns 204 on success — no body. The frontend should refresh the
+         *     user list and show a toast like "User deleted."
+         *
+         *     Returns 404 if the user_id doesn't exist.
+         *     Returns 409 if the deletion would leave the system without an Admin
+         *     or if the actor is trying to delete themselves.
+         */
         delete: operations["delete_user_admin_users__user_id__delete"];
         options?: never;
         head?: never;
@@ -227,7 +258,15 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Admin-initiated reset; returns one-time reset URL (~30m TTL). */
+        /**
+         * Admin-initiated password reset. Returns a one-time reset URL.
+         * @description Admin clicks 'Reset Password' on a user. Returns a fresh reset URL
+         *     with a 30-minute TTL. The admin shares this URL with the user out-of-band.
+         *
+         *     Audit row: ADMIN_PASSWORD_RESET_INITIATED with the admin as actor.
+         *     The subsequent PASSWORD_RESET_COMPLETED row will attribute the user.
+         *     The two-row pair forms the complete forensic record.
+         */
         post: operations["admin_reset_password_admin_users__user_id__reset_password_post"];
         delete?: never;
         options?: never;
@@ -755,6 +794,31 @@ export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
         /**
+         * AdminInitiateResetResponse
+         * @description Returned to the admin who initiated the reset. The reset_url is included
+         *     so the admin can hand-deliver it (Slack, in-person) when email is
+         *     unavailable. The plaintext token is gone after this response.
+         */
+        AdminInitiateResetResponse: {
+            /**
+             * User Id
+             * Format: uuid
+             */
+            user_id: string;
+            /**
+             * Email
+             * Format: email
+             */
+            email: string;
+            /** Reset Url */
+            reset_url: string;
+            /**
+             * Expires At
+             * Format: date-time
+             */
+            expires_at: string;
+        };
+        /**
          * AdminUserDetailResponse
          * @description Full detail. Same shape today; reserves room for future fields.
          */
@@ -764,13 +828,10 @@ export interface components {
              * Format: uuid
              */
             id: string;
-            /**
-             * Email
-             * Format: email
-             */
+            /** Email */
             email: string;
             /** Full Name */
-            full_name: string;
+            full_name: string | null;
             /**
              * Role
              * @enum {string}
@@ -803,13 +864,10 @@ export interface components {
              * Format: uuid
              */
             id: string;
-            /**
-             * Email
-             * Format: email
-             */
+            /** Email */
             email: string;
             /** Full Name */
-            full_name: string;
+            full_name: string | null;
             /**
              * Role
              * @enum {string}
@@ -840,29 +898,6 @@ export interface components {
             page_size: number;
             /** Total */
             total: number;
-        };
-        /**
-         * AdminInitiateResetResponse
-         * @description Admin receives a hand-off reset URL for the target user.
-         */
-        AdminInitiateResetResponse: {
-            /**
-             * User Id
-             * Format: uuid
-             */
-            user_id: string;
-            /**
-             * Email
-             * Format: email
-             */
-            email: string;
-            /** Reset Url */
-            reset_url: string;
-            /**
-             * Expires At
-             * Format: date-time
-             */
-            expires_at: string;
         };
         /** AdvancedCharts */
         AdvancedCharts: {
@@ -1231,6 +1266,21 @@ export interface components {
             upper_bound?: number | null;
             /** Confidence Tier */
             confidence_tier?: string | null;
+            /**
+             * Ci Ratio
+             * @description Half-width of the Confidence Interval: (upper_bound - lower_bound) / 2
+             */
+            ci_ratio?: number | null;
+            /**
+             * Ci Gap
+             * @description Relative uncertainty: ci_ratio - predicted
+             */
+            ci_gap?: number | null;
+            /**
+             * Risk Factor
+             * @description Rule-based tier: Low | Medium | High | Critical
+             */
+            risk_factor?: string | null;
         };
         /** ForecastGraphResponse */
         ForecastGraphResponse: {
@@ -1257,6 +1307,32 @@ export interface components {
             forecasted_bookings_10w: number;
             /** Critical Weeks */
             critical_weeks: components["schemas"]["CriticalForecastWeek"][];
+        };
+        /** ForgotPasswordRequest */
+        ForgotPasswordRequest: {
+            /**
+             * Email
+             * Format: email
+             */
+            email: string;
+        };
+        /**
+         * ForgotPasswordResponse
+         * @description Generic response. ALWAYS the same regardless of whether the email exists.
+         *     No enumeration leak.
+         */
+        ForgotPasswordResponse: {
+            /**
+             * Status
+             * @default ok
+             * @constant
+             */
+            status: "ok";
+            /**
+             * Message
+             * @default If an account exists for this email, a password reset link has been sent.
+             */
+            message: string;
         };
         /** GlobalSettingItem */
         GlobalSettingItem: {
@@ -1379,14 +1455,7 @@ export interface components {
             /** Count */
             count: number;
         };
-        /**
-         * LoginRequest
-         * @description Plaintext credentials. Travels over TLS; never logged; never persisted.
-         *     Field-level constraints are deliberately permissive — we let the
-         *     auth_service make the actual reject/accept decision based on hash
-         *     verification, so that an invalid email shape and a wrong password
-         *     return the same opaque 401 (no enumeration).
-         */
+        /** LoginRequest */
         LoginRequest: {
             /**
              * Email
@@ -1614,35 +1683,7 @@ export interface components {
              */
             refresh_expires_at: string;
         };
-        /** ForgotPasswordRequest */
-        ForgotPasswordRequest: {
-            /**
-             * Email
-             * Format: email
-             */
-            email: string;
-        };
-        /**
-         * ForgotPasswordResponse
-         * @description Generic response to prevent email enumeration.
-         */
-        ForgotPasswordResponse: {
-            /**
-             * Status
-             * @default ok
-             * @constant
-             */
-            status?: "ok";
-            /** Message */
-            message?: string;
-        };
-        /**
-         * RegisterRequest
-         * @description Submitted when an invitee clicks the invite URL and sets their password.
-         *     The invite_token is the PLAINTEXT half of the (raw, hash) pair generated
-         *     by Phase 0's core.security.generate_invite_token; the server SHA-256s it
-         *     on arrival to find the matching invite_tokens row.
-         */
+        /** RegisterRequest */
         RegisterRequest: {
             /** Invite Token */
             invite_token: string;
@@ -1665,14 +1706,17 @@ export interface components {
              * @default ok
              * @constant
              */
-            status?: "ok";
+            status: "ok";
             /**
              * Email
              * Format: email
              */
             email: string;
-            /** Message */
-            message?: string;
+            /**
+             * Message
+             * @default Password reset successful. Please log in with your new password.
+             */
+            message: string;
         };
         /** ResidualPoint */
         ResidualPoint: {
@@ -2023,6 +2067,26 @@ export interface operations {
             };
         };
     };
+    me_auth_me_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeResponse"];
+                };
+            };
+        };
+    };
     forgot_password_auth_forgot_password_post: {
         parameters: {
             query?: never;
@@ -2085,26 +2149,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    me_auth_me_get: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeResponse"];
                 };
             };
         };
@@ -2175,6 +2219,35 @@ export interface operations {
             };
         };
     };
+    delete_user_admin_users__user_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     patch_user_admin_users__user_id__patch: {
         parameters: {
             query?: never;
@@ -2198,35 +2271,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AdminUserDetailResponse"];
                 };
-            };
-            /** @description Validation Error */
-            422: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["HTTPValidationError"];
-                };
-            };
-        };
-    };
-    delete_user_admin_users__user_id__delete: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                user_id: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Successful Response */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
             /** @description Validation Error */
             422: {

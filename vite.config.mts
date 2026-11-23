@@ -6,12 +6,15 @@ export default defineConfig(({ mode, command }) => {
   const env = loadEnv(mode, process.cwd(), "VITE_");
   const apiBaseUrl = env.VITE_API_BASE_URL ?? "/backend";
   const localPreview = command === "serve" && apiBaseUrl === "/backend";
-  const preview = process.env.VERCEL_ENV === "preview" || localPreview;
+  const vercelHosted = ["preview", "production"].includes(process.env.VERCEL_ENV ?? "");
+  const hostedViewer = (vercelHosted || localPreview) && apiBaseUrl === "/backend";
+  const browserTraining = hostedViewer && env.VITE_XOCOMPASS_BROWSER_TRAINING !== "0";
   return {
     plugins: [react()],
     define: {
       "import.meta.env.VITE_API_BASE_URL": JSON.stringify(apiBaseUrl),
-      "import.meta.env.XOCOMPASS_HOSTED_PREVIEW": JSON.stringify(preview && apiBaseUrl === "/backend"),
+      "import.meta.env.XOCOMPASS_HOSTED_PREVIEW": JSON.stringify(hostedViewer),
+      "import.meta.env.VITE_XOCOMPASS_BROWSER_TRAINING": JSON.stringify(browserTraining ? "1" : "0"),
     },
     server: {
       port: 5173,

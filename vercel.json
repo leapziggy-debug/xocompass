@@ -2,7 +2,7 @@
   "rewrites": [
     {
       "source": "/backend/:path*",
-      "destination": "https://xocompass-viewer-preview-4p0kb8mfn-lanzmanalacs-projects.vercel.app/:path*"
+      "destination": "https://xocompass-viewer-preview-h1ms3p1xf-lanzmanalacs-projects.vercel.app/:path*"
     },
     {
       "source": "/((?!api/published-forecast(?:/|$)|training(?:/|$)).*)",
